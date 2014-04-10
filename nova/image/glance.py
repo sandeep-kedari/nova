@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 OpenStack Foundation
 # All Rights Reserved.
 #
@@ -25,11 +23,12 @@ import json
 import random
 import sys
 import time
-import urlparse
-
+import re
 import glanceclient
 import glanceclient.exc
 from oslo.config import cfg
+import six
+import six.moves.urllib.parse as urlparse
 
 from nova import exception
 import nova.image.download as image_xfers
@@ -43,10 +42,10 @@ from nova import utils
 glance_opts = [
     cfg.StrOpt('glance_host',
                default='$my_ip',
-               help='default glance hostname or ip'),
+               help='Default glance hostname or IP address'),
     cfg.IntOpt('glance_port',
                default=9292,
-               help='default glance port'),
+               help='Default glance port'),
     cfg.StrOpt('glance_protocol',
                 default='http',
                 help='Default protocol to use when connecting to glance. '
@@ -62,7 +61,7 @@ glance_opts = [
                      'glance'),
     cfg.IntOpt('glance_num_retries',
                default=0,
-               help='Number retries when downloading an image from glance'),
+               help='Number of retries when downloading an image from glance'),
     cfg.ListOpt('allowed_direct_url_schemes',
                 default=[],
                 help='A list of url scheme that can be downloaded directly '
@@ -227,6 +226,40 @@ class GlanceClientWrapper(object):
                 LOG.exception(error_msg)
                 time.sleep(1)
 
+    def call2(self, context, version, method, *args, **kwargs):
+        """
+        Call a glance client method.  If we get a connection error,
+        retry the request according to CONF.glance_num_retries.
+        """
+        retry_excs = (glanceclient.exc.ServiceUnavailable,
+                glanceclient.exc.InvalidEndpoint,
+                glanceclient.exc.CommunicationError)
+        num_attempts = 1 + CONF.glance_num_retries
+
+        for attempt in xrange(1, num_attempts + 1):
+            client = self.client or self._create_onetime_client(context,
+                                                                version)
+            try:
+                return getattr(client.image_tags, method)(*args, **kwargs)
+            except retry_excs as e:
+                host = self.host
+                port = self.port
+                extra = "retrying"
+                error_msg = (_("Error contacting glance server "
+                               "'%(host)s:%(port)s' for '%(method)s', "
+                               "%(extra)s.") %
+                             {'host': host, 'port': port,
+                              'method': method, 'extra': extra})
+                if attempt == num_attempts:
+                    extra = 'done trying'
+                    LOG.exception(error_msg)
+                    raise exception.GlanceConnectionFailed(
+                            host=host, port=port, reason=str(e))
+                LOG.exception(error_msg)
+                time.sleep(1)
+
+
+
 
 class GlanceImageService(object):
     """Provides storage and retrieval of disk image objects within Glance."""
@@ -294,6 +327,64 @@ class GlanceImageService(object):
 
         base_image_meta = self._translate_from_glance(image)
         return base_image_meta
+	
+    
+
+    def get_all_image_metadata(self, context, search_filts):
+	"""Customise Function for Image_metadata"""
+        return self._get_all_image_metadata(
+            context, search_filts, metadata_type='metadata')
+    
+    def _get_all_image_metadata(self, context, search_filts, metadata_type):
+        """Get all metadata."""
+
+        def _match_any(pattern_list, string):
+            return any([re.match(pattern, string)
+                        for pattern in pattern_list])
+
+        def _filter_metadata(image, search_filt, input_metadata):
+            uuids = search_filt.get('resource_id', [])
+            keys_filter = search_filt.get('key', [])
+            values_filter = search_filt.get('value', [])
+            output_metadata = {}
+
+            if uuids and image['id'] not in uuids:
+                return {}
+
+            for (k, v) in input_metadata.iteritems():
+                # Both keys and value defined -- AND
+                if ((keys_filter and values_filter) and
+                   not _match_any(keys_filter, k) and
+                   not _match_any(values_filter, v)):
+                    continue
+                # Only keys or value is defined
+                elif ((keys_filter and not _match_any(keys_filter, k)) or
+                      (values_filter and not _match_any(values_filter, v))):
+                    continue
+
+                output_metadata[k] = v
+            return output_metadata
+
+        formatted_metadata_list = []
+        images = self.detail(context)
+        for image in images:
+            try:
+                metadata = image['properties']
+                for filt in search_filts:
+                    # By chaining the input to the output, the filters are
+                    # ANDed together
+                    metadata = _filter_metadata(image, filt, metadata)
+
+                for (k, v) in metadata.iteritems():
+                    formatted_metadata_list.append({'key': k, 'value': v,
+                                     'image_id': image['id']})
+            except exception.PolicyNotAuthorized:
+                # failed policy check - not allowed to
+                # read this metadata
+                continue
+
+        return formatted_metadata_list
+    
 
     def _get_locations(self, context, image_id):
         """Returns the direct url representing the backend storage location,
@@ -396,6 +487,7 @@ class GlanceImageService(object):
         else:
             return self._translate_from_glance(image_meta)
 
+
     def delete(self, context, image_id):
         """Delete the given image.
 
@@ -467,13 +559,13 @@ def _convert_timestamps_to_datetimes(image_meta):
 # NOTE(bcwaldon): used to store non-string data in glance metadata
 def _json_loads(properties, attr):
     prop = properties[attr]
-    if isinstance(prop, basestring):
+    if isinstance(prop, six.string_types):
         properties[attr] = jsonutils.loads(prop)
 
 
 def _json_dumps(properties, attr):
     prop = properties[attr]
-    if not isinstance(prop, basestring):
+    if not isinstance(prop, six.string_types):
         properties[attr] = jsonutils.dumps(prop)
 
 
@@ -593,3 +685,17 @@ def get_remote_image_service(context, image_href):
 
 def get_default_image_service():
     return GlanceImageService()
+
+
+class UpdateGlanceImage(object):
+    def __init__(self, context, image_id, metadata, stream):
+        self.context = context
+        self.image_id = image_id
+        self.metadata = metadata
+        self.image_stream = stream
+
+    def start(self):
+        image_service, image_id = (
+            get_remote_image_service(self.context, self.image_id))
+        image_service.update(self.context, image_id, self.metadata,
+                             self.image_stream, purge_props=False)

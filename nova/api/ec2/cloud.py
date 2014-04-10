@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # All Rights Reserved.
@@ -37,13 +35,15 @@ from nova import block_device
 from nova.cloudpipe import pipelib
 from nova import compute
 from nova.compute import api as compute_api
-from nova.compute import flavors
+from nova.image import glance
 from nova.compute import vm_states
 from nova import db
 from nova import exception
 from nova.image import s3
 from nova import network
 from nova.network.security_group import neutron_driver
+from nova.objects import base as obj_base
+from nova.objects import flavor as flavor_obj
 from nova.objects import instance as instance_obj
 from nova.openstack.common.gettextutils import _
 from nova.openstack.common import log as logging
@@ -52,27 +52,28 @@ from nova import quota
 from nova import servicegroup
 from nova import utils
 from nova import volume
+#from glance.openstack.common import gettextutils gettextutils.install('glance')
 
 ec2_opts = [
     cfg.StrOpt('ec2_host',
                default='$my_ip',
-               help='the ip of the ec2 api server'),
+               help='The IP address of the EC2 API server'),
     cfg.StrOpt('ec2_dmz_host',
                default='$my_ip',
-               help='the internal ip of the ec2 api server'),
+               help='The internal IP address of the EC2 API server'),
     cfg.IntOpt('ec2_port',
                default=8773,
-               help='the port of the ec2 api server'),
+               help='The port of the EC2 API server'),
     cfg.StrOpt('ec2_scheme',
                default='http',
-               help='the protocol to use when connecting to the ec2 api '
+               help='The protocol to use when connecting to the EC2 API '
                     'server (http, https)'),
     cfg.StrOpt('ec2_path',
                default='/services/Cloud',
-               help='the path prefix used to call the ec2 api server'),
+               help='The path prefix used to call the ec2 API server'),
     cfg.ListOpt('region_list',
                 default=[],
-                help='list of region=fqdn pairs separated by commas'),
+                help='List of region=fqdn pairs separated by commas'),
 ]
 
 CONF = cfg.CONF
@@ -85,9 +86,6 @@ CONF.import_opt('internal_service_availability_zone',
 LOG = logging.getLogger(__name__)
 
 QUOTAS = quota.QUOTAS
-
-security_group_authorizer = extensions.extension_authorizer('compute',
-                                                            'security_groups')
 
 
 def validate_ec2_id(val):
@@ -212,15 +210,6 @@ def _format_mappings(properties, result):
         result['blockDeviceMapping'] = mappings
 
 
-def db_to_inst_obj(context, db_instance):
-    # NOTE(danms): This is a temporary helper method for converting
-    # Instance DB objects to NovaObjects without needing to re-query.
-    inst_obj = instance_obj.Instance._from_db_object(
-        context, instance_obj.Instance(), db_instance,
-        expected_attrs=['system_metadata', 'metadata'])
-    return inst_obj
-
-
 class CloudController(object):
     """CloudController provides the critical dispatch between
  inbound API calls through the endpoint and messages
@@ -236,6 +225,7 @@ class CloudController(object):
                                    security_group_api=self.security_group_api)
         self.keypair_api = compute_api.KeypairAPI()
         self.servicegroup_api = servicegroup.API()
+	self.service = glance.get_default_image_service()
 
     def __str__(self):
         return 'CloudController'
@@ -635,8 +625,6 @@ class CloudController(object):
         security_group = self.security_group_api.get(context, group_name,
                                                      group_id)
 
-        security_group_authorizer(context, security_group)
-
         prevalues = kwargs.get('ip_permissions', [kwargs])
 
         rule_ids = []
@@ -670,8 +658,6 @@ class CloudController(object):
 
         security_group = self.security_group_api.get(context, group_name,
                                                      group_id)
-
-        security_group_authorizer(context, security_group)
 
         prevalues = kwargs.get('ip_permissions', [kwargs])
         postvalues = []
@@ -714,7 +700,7 @@ class CloudController(object):
 
     def create_security_group(self, context, group_name, group_description):
         if isinstance(group_name, unicode):
-            group_name = group_name.encode('utf-8')
+            group_name = utils.utf8(group_name)
         if CONF.ec2_strict_validation:
             # EC2 specification gives constraints for name and description:
             # Accepts alphanumeric characters, spaces, dashes, and underscores
@@ -744,8 +730,6 @@ class CloudController(object):
 
         security_group = self.security_group_api.get(context, group_name,
                                                      group_id)
-
-        security_group_authorizer(context, security_group)
 
         self.security_group_api.destroy(context, security_group)
 
@@ -879,7 +863,8 @@ class CloudController(object):
         validate_ec2_id(volume_id)
         volume_id = ec2utils.ec2_vol_id_to_uuid(volume_id)
         instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, instance_id)
-        instance = self.compute_api.get(context, instance_uuid)
+        instance = self.compute_api.get(context, instance_uuid,
+                                        want_objects=True)
         LOG.audit(_('Attach volume %(volume_id)s to instance %(instance_id)s '
                     'at %(device)s'),
                   {'volume_id': volume_id,
@@ -998,7 +983,8 @@ class CloudController(object):
 
         validate_ec2_id(instance_id)
         instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, instance_id)
-        instance = self.compute_api.get(context, instance_uuid)
+        instance = self.compute_api.get(context, instance_uuid,
+                                        want_objects=True)
         result = {'instance_id': instance_id}
         fn(instance, result)
         return result
@@ -1090,8 +1076,8 @@ class CloudController(object):
 
     @staticmethod
     def _format_instance_type(instance, result):
-        instance_type = flavors.extract_flavor(instance)
-        result['instanceType'] = instance_type['name']
+        flavor = instance.get_flavor()
+        result['instanceType'] = flavor.name
 
     @staticmethod
     def _format_group_set(instance, result):
@@ -1123,7 +1109,8 @@ class CloudController(object):
                     try:
                         instance_uuid = ec2utils.ec2_inst_id_to_uuid(context,
                                                                      ec2_id)
-                        instance = self.compute_api.get(context, instance_uuid)
+                        instance = self.compute_api.get(context, instance_uuid,
+                                                        want_objects=True)
                     except exception.NotFound:
                         continue
                     instances.append(instance)
@@ -1133,7 +1120,8 @@ class CloudController(object):
                 search_opts['deleted'] = False
                 instances = self.compute_api.get_all(context,
                                                      search_opts=search_opts,
-                                                     sort_dir='asc')
+                                                     sort_dir='asc',
+                                                     want_objects=True)
             except exception.NotFound:
                 instances = []
 
@@ -1174,6 +1162,10 @@ class CloudController(object):
 
             for k, v in utils.instance_meta(instance).iteritems():
                 i['tagSet'].append({'key': k, 'value': v})
+
+            client_token = self._get_client_token(context, instance_uuid)
+            if client_token:
+                i['clientToken'] = client_token
 
             if context.is_admin:
                 i['keyName'] = '%s (%s, %s)' % (i['keyName'],
@@ -1277,6 +1269,18 @@ class CloudController(object):
 
     def run_instances(self, context, **kwargs):
         min_count = int(kwargs.get('min_count', 1))
+        max_count = int(kwargs.get('max_count', min_count))
+        try:
+            min_count = utils.validate_integer(
+                min_count, "min_count", min_value=1)
+            max_count = utils.validate_integer(
+                max_count, "max_count", min_value=1)
+        except exception.InvalidInput as e:
+            raise exception.InvalidInput(message=e.format_message())
+
+        if min_count > max_count:
+            msg = _('min_count must be <= max_count')
+            raise exception.InvalidInput(message=msg)
 
         client_token = kwargs.get('client_token')
         if client_token:
@@ -1310,9 +1314,12 @@ class CloudController(object):
             msg = _('Image must be available')
             raise exception.ImageNotActive(message=msg)
 
+        flavor = flavor_obj.Flavor.get_by_name(context,
+                                               kwargs.get('instance_type',
+                                                          None))
+
         (instances, resv_id) = self.compute_api.create(context,
-            instance_type=flavors.get_flavor_by_name(
-                kwargs.get('instance_type', None)),
+            instance_type=obj_base.obj_to_primitive(flavor),
             image_href=image_uuid,
             max_count=int(kwargs.get('max_count', min_count)),
             min_count=min_count,
@@ -1339,6 +1346,11 @@ class CloudController(object):
                 db.instance_system_metadata_update(
                     context, instance_uuid, {'EC2_client_token': client_token},
                     delete=False)
+
+    def _get_client_token(self, context, instance_uuid):
+        """Get client token for a given instance."""
+        sys_meta = db.instance_system_metadata_get(context, instance_uuid)
+        return sys_meta.get('EC2_client_token')
 
     def _remove_client_token(self, context, instance_ids):
         """Remove client token to reservation ID mapping."""
@@ -1411,6 +1423,7 @@ class CloudController(object):
         instances = self._ec2_ids_to_instances(context, instance_id, True)
         LOG.debug(_("Going to stop instances"))
         for instance in instances:
+            extensions.check_compute_policy(context, 'stop', instance)
             self.compute_api.stop(context, instance)
         return True
 
@@ -1421,6 +1434,7 @@ class CloudController(object):
         instances = self._ec2_ids_to_instances(context, instance_id, True)
         LOG.debug(_("Going to start instances"))
         for instance in instances:
+            extensions.check_compute_policy(context, 'start', instance)
             self.compute_api.start(context, instance)
         return True
 
@@ -1652,11 +1666,8 @@ class CloudController(object):
         instance = self.compute_api.get(context, instance_uuid,
                                         want_objects=True)
 
-        bdms = self.compute_api.get_instance_bdms(context, instance)
-
         # CreateImage only supported for the analogue of EBS-backed instances
-        if not self.compute_api.is_volume_backed_instance(context, instance,
-                                                          bdms):
+        if not self.compute_api.is_volume_backed_instance(context, instance):
             msg = _("Invalid value '%(ec2_instance_id)s' for instanceId. "
                     "Instance does not have a volume attached at root "
                     "(%(root)s)") % {'root': instance['root_device_name'],
@@ -1739,17 +1750,20 @@ class CloudController(object):
             msg = _('Expecting a list of resources')
             raise exception.InvalidParameterValue(message=msg)
 
-        for r in resources:
-            if ec2utils.resource_type_from_id(context, r) != 'instance':
-                msg = _('Only instances implemented')
-                raise exception.InvalidParameterValue(message=msg)
-
         if not isinstance(tags, (tuple, list, set)):
             msg = _('Expecting a list of tagSets')
             raise exception.InvalidParameterValue(message=msg)
-
+        
         metadata = {}
-        for tag in tags:
+       
+        for r in resources:
+            resource_list=['instance','image']
+            tag_created_for = ec2utils.resource_type_from_id(context, r)
+            if tag_created_for not in resource_list:
+                msg = _('Only instances and Images only Implemented')
+                raise exception.InvalidParameterValue(message=msg)
+        
+	for tag in tags:
             if not isinstance(tag, dict):
                 err = _('Expecting tagSet to be key/value pairs')
                 raise exception.InvalidParameterValue(message=err)
@@ -1761,13 +1775,22 @@ class CloudController(object):
                 err = _('Expecting both key and value to be set')
                 raise exception.InvalidParameterValue(message=err)
 
-            metadata[key] = val
+        metadata[key] =  val
 
         for ec2_id in resources:
-            instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
-            instance = self.compute_api.get(context, instance_uuid)
-            self.compute_api.update_instance_metadata(context,
+	    if tag_created_for == 'instance':
+            	instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
+            	instance = self.compute_api.get(context, instance_uuid,
+                                            want_objects=True)
+            	self.compute_api.update_instance_metadata(context,
                 instance, metadata)
+
+	    elif tag_created_for == 'image':
+		self.service = glance.get_default_image_service()
+		image_uuid = ec2utils.ec2_id_to_glance_id(context,ec2_id)
+		image = self.service.show(context,image_uuid)
+		image['properties'].update(metadata)
+		self.service.update(context, image_uuid,image)
 
         return True
 
@@ -1787,20 +1810,20 @@ class CloudController(object):
         if not isinstance(resources, (tuple, list, set)):
             msg = _('Expecting a list of resources')
             raise exception.InvalidParameterValue(message=msg)
-
-        for r in resources:
-            if ec2utils.resource_type_from_id(context, r) != 'instance':
-                msg = _('Only instances implemented')
-                raise exception.InvalidParameterValue(message=msg)
-
-        if not isinstance(tags, (tuple, list, set)):
+	
+	if not isinstance(tags, (tuple, list, set)):
             msg = _('Expecting a list of tagSets')
             raise exception.InvalidParameterValue(message=msg)
 
-        for ec2_id in resources:
-            instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
-            instance = self.compute_api.get(context, instance_uuid)
-            for tag in tags:
+
+        """Newly Added code for checking Resource Type"""
+	for r in resources:
+            resource_list=['instance','image']
+            tag_created_for = ec2utils.resource_type_from_id(context, r)
+            if tag_created_for not in resource_list:
+                msg = _('Only instances and Images only Implemented')
+
+        for tag in tags:
                 if not isinstance(tag, dict):
                     msg = _('Expecting tagSet to be key/value pairs')
                     raise exception.InvalidParameterValue(message=msg)
@@ -1810,9 +1833,19 @@ class CloudController(object):
                     msg = _('Expecting key to be set')
                     raise exception.InvalidParameterValue(message=msg)
 
-                self.compute_api.delete_instance_metadata(context,
+        for ec2_id in resources:
+	    if tag_created_for == 'instance':
+                instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
+                instance = self.compute_api.get(context, instance_uuid,
+                                            want_objects=True)
+	        self.compute_api.delete_instance_metadata(context,
                         instance, key)
-
+            elif tag_created_for == 'image':
+                self.service = glance.get_default_image_service()
+                image_uuid = ec2utils.ec2_id_to_glance_id(context,ec2_id)
+                image = self.service.show(context, image_uuid)
+		image['properties'].pop(key,None)
+               	self.service.update(context, image_uuid,image)
         return True
 
     def describe_tags(self, context, **kwargs):
@@ -1824,6 +1857,8 @@ class CloudController(object):
         """
         filters = kwargs.get('filter', None)
         search_filts = []
+        isImage=None
+	isInstance=None
         if filters:
             for filter_block in filters:
                 key_name = filter_block.get('name', None)
@@ -1838,28 +1873,55 @@ class CloudController(object):
                     if key_name in ('resource_id', 'resource-id'):
                         search_block['resource_id'] = []
                         for res_id in val:
-                            search_block['resource_id'].append(
-                                ec2utils.ec2_inst_id_to_uuid(context, res_id))
+			    if 'ami-0' in res_id:
+				isImage = True
+				isInstance = False
+                                search_block['resource_id'].append(
+                                    ec2utils.ec2_id_to_glance_id(context, res_id))
+			    else:
+				isImage = False
+			        search_block['resource_id'].append(
+                                    ec2utils.ec2_inst_id_to_uuid(context, res_id))
                     elif key_name in ['key', 'value']:
+			isImage = True
+			isInstance = True
                         search_block[key_name] = \
                             [ec2utils.regex_from_ec2_regex(v) for v in val]
                     elif key_name in ('resource_type', 'resource-type'):
+			resource_list=['instance','image']
                         for res_type in val:
-                            if res_type != 'instance':
+                            if res_type not in resource_list:
                                 raise exception.InvalidParameterValue(
-                                    message=_('Only instances implemented'))
-                            search_block[key_name] = 'instance'
+                                    message=_('Only instances and Image implemented'))
+			    if res_type == 'image':
+				isImage = True
+                                isInstance = False
+				search_block[key_name] = res_type
+
+			    else:
+				isImage = False
+                                search_block[key_name] = res_type
                     if len(search_block.keys()) > 0:
                         search_filts.append(search_block)
         ts = []
-        for tag in self.compute_api.get_all_instance_metadata(context,
+	self.service = glance.get_default_image_service()
+	if isImage == True or isImage == None: 
+            for image_tag in  self.service.get_all_image_metadata(context, search_filts):
+	       		ts.append({
+	           	    'resource_id': ec2utils.glance_id_to_ec2_id(context, image_tag['image_id']),
+                      	    'resource_type': 'image',
+	                    'key': image_tag['key'],
+                            'value': image_tag['value']
+	                })
+	if isInstance == True or isInstance == None:
+            for tag in self.compute_api.get_all_instance_metadata(context,
                                                               search_filts):
-            ts.append({
-                'resource_id': ec2utils.id_to_ec2_inst_id(tag['instance_id']),
-                'resource_type': 'instance',
-                'key': tag['key'],
-                'value': tag['value']
-            })
+                ts.append({
+                    'resource_id': ec2utils.id_to_ec2_inst_id(tag['instance_id']),
+                    'resource_type': 'instance',
+                    'key': tag['key'],
+                    'value': tag['value']
+                })
         return {"tagSet": ts}
 
 

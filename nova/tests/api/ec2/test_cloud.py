@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright (c) 2011 X.commerce, a business unit of eBay Inc.
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -23,7 +21,6 @@ import copy
 import datetime
 import functools
 import iso8601
-import mock
 import os
 import string
 import tempfile
@@ -45,8 +42,13 @@ from nova import context
 from nova import db
 from nova import exception
 from nova.image import s3
+from nova.image import glance as service
 from nova.network import api as network_api
+from nova.network import model
 from nova.network import neutronv2
+from nova.objects import instance as instance_obj
+from nova.objects import instance_info_cache as instance_info_cache_obj
+from nova.objects import security_group as security_group_obj
 from nova.openstack.common import log as logging
 from nova.openstack.common import policy as common_policy
 from nova.openstack.common import timeutils
@@ -54,6 +56,7 @@ from nova import test
 from nova.tests.api.openstack.compute.contrib import (
     test_neutron_security_groups as test_neutron)
 from nova.tests import cast_as_call
+from nova.tests import fake_block_device
 from nova.tests import fake_network
 from nova.tests import fake_utils
 from nova.tests.image import fake
@@ -101,7 +104,7 @@ def get_fake_cache(get_floating):
         info[0]['network']['subnets'].append({'cidr': 'fe80:b33f::/64',
                                               'ips': [_ip(ipv6_addr)]})
 
-    return info
+    return model.NetworkInfo.hydrate(info)
 
 
 def get_instances_with_cached_ips(orig_func, get_floating,
@@ -110,13 +113,19 @@ def get_instances_with_cached_ips(orig_func, get_floating,
     entries
     """
     instances = orig_func(*args, **kwargs)
-    if isinstance(instances, list):
-        for instance in instances:
-            instance['info_cache'] = {'network_info':
-                                     get_fake_cache(get_floating)}
+
+    if kwargs.get('want_objects', False):
+        info_cache = instance_info_cache_obj.InstanceInfoCache()
+        info_cache.network_info = get_fake_cache(get_floating)
+        info_cache.obj_reset_changes()
     else:
-        instances['info_cache'] = {'network_info':
-                                  get_fake_cache(get_floating)}
+        info_cache = {'network_info': get_fake_cache(get_floating)}
+
+    if isinstance(instances, (list, instance_obj.InstanceList)):
+        for instance in instances:
+            instance['info_cache'] = info_cache
+    else:
+        instances['info_cache'] = info_cache
     return instances
 
 
@@ -139,15 +148,17 @@ class CloudTestCase(test.TestCase):
                         'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
                         'ramdisk_id': 'cedef40a-ed67-4d10-800e-17455edce175',
                         'type': 'machine',
-                        'image_state': 'available'}}
+                        'image_state': 'available',
+				}}
 
         def fake_detail(_self, context, **kwargs):
             image = fake_show(None, context, None)
             image['name'] = kwargs.get('filters', {}).get('name')
             return [image]
+	
 
-        self.stubs.Set(fake._FakeImageService, 'show', fake_show)
-        self.stubs.Set(fake._FakeImageService, 'detail', fake_detail)
+        #self.stubs.Set(fake._FakeImageService, 'show', fake_show)
+        #self.stubs.Set(fake._FakeImageService, 'detail', fake_detail)
         fake.stub_out_image_service(self.stubs)
 
         def dumb(*args, **kwargs):
@@ -442,7 +453,7 @@ class CloudTestCase(test.TestCase):
 
     def test_security_group_quota_limit(self):
         self.flags(quota_security_groups=10)
-        for i in range(1, CONF.quota_security_groups + 1):
+        for i in range(1, CONF.quota_security_groups):
             name = 'test name %i' % i
             descript = 'test description %i' % i
             create = self.cloud.create_security_group
@@ -472,34 +483,6 @@ class CloudTestCase(test.TestCase):
     def test_delete_security_group_no_params(self):
         delete = self.cloud.delete_security_group
         self.assertRaises(exception.MissingParameter, delete, self.context)
-
-    def test_delete_security_group_policy_not_allowed(self):
-        rules = common_policy.Rules(
-                {'compute_extension:security_groups':
-                    common_policy.parse_rule('project_id:%(project_id)s')})
-        common_policy.set_rules(rules)
-
-        with mock.patch.object(self.cloud.security_group_api,
-                'get') as get:
-            get.return_value = {'project_id': 'invalid'}
-
-            self.assertRaises(exception.PolicyNotAuthorized,
-                    self.cloud.delete_security_group, self.context,
-                    'fake-name', 'fake-id')
-
-    def test_authorize_security_group_ingress_policy_not_allowed(self):
-        rules = common_policy.Rules(
-                {'compute_extension:security_groups':
-                    common_policy.parse_rule('project_id:%(project_id)s')})
-        common_policy.set_rules(rules)
-
-        with mock.patch.object(self.cloud.security_group_api,
-                'get') as get:
-            get.return_value = {'project_id': 'invalid'}
-
-            self.assertRaises(exception.PolicyNotAuthorized,
-                    self.cloud.authorize_security_group_ingress, self.context,
-                    'fake-name', 'fake-id')
 
     def test_authorize_security_group_ingress(self):
         kwargs = {'project_id': self.context.project_id, 'name': 'test'}
@@ -571,9 +554,9 @@ class CloudTestCase(test.TestCase):
         self.assertTrue(authz(self.context, group_name=sec1['name'], **kwargs))
         describe = self.cloud.describe_security_groups
         groups = describe(self.context, group_name=['test'])
-        self.assertEquals(len(groups['securityGroupInfo']), 1)
+        self.assertEqual(len(groups['securityGroupInfo']), 1)
         actual_rules = groups['securityGroupInfo'][0]['ipPermissions']
-        self.assertEquals(len(actual_rules), 4)
+        self.assertEqual(len(actual_rules), 4)
         expected_rules = [{'fromPort': -1,
                            'groups': [{'groupName': 'somegroup1',
                                        'userId': 'someuser'}],
@@ -599,25 +582,11 @@ class CloudTestCase(test.TestCase):
                            'ipRanges': [],
                            'toPort': 80}]
         for rule in expected_rules:
-            self.assertTrue(rule in actual_rules)
+            self.assertIn(rule, actual_rules)
 
         db.security_group_destroy(self.context, sec3['id'])
         db.security_group_destroy(self.context, sec2['id'])
         db.security_group_destroy(self.context, sec1['id'])
-
-    def test_revoke_security_group_ingress_policy_not_allowed(self):
-        rules = common_policy.Rules(
-                {'compute_extension:security_groups':
-                    common_policy.parse_rule('project_id:%(project_id)s')})
-        common_policy.set_rules(rules)
-
-        with mock.patch.object(self.cloud.security_group_api,
-                'get') as get:
-            get.return_value = {'project_id': 'invalid'}
-
-            self.assertRaises(exception.PolicyNotAuthorized,
-                    self.cloud.revoke_security_group_ingress, self.context,
-                    'fake-name', 'fake-id')
 
     def test_revoke_security_group_ingress(self):
         kwargs = {'project_id': self.context.project_id, 'name': 'test'}
@@ -687,7 +656,7 @@ class CloudTestCase(test.TestCase):
 
         describe = self.cloud.describe_security_groups
         groups = describe(self.context, group_name=['test'])
-        self.assertEquals(len(groups['securityGroupInfo']), 1)
+        self.assertEqual(len(groups['securityGroupInfo']), 1)
         actual_rules = groups['securityGroupInfo'][0]['ipPermissions']
         expected_rules = [{'groups': [{'groupName': 'test',
                                        'userId': self.context.user_id}],
@@ -840,6 +809,8 @@ class CloudTestCase(test.TestCase):
         image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
         sys_meta = flavors.save_flavor_info(
             {}, flavors.get_flavor(1))
+
+        sys_meta['EC2_client_token'] = "client-token-1"
         inst1 = db.instance_create(self.context, {'reservation_id': 'a',
                                                   'image_ref': image_uuid,
                                                   'instance_type_id': 1,
@@ -847,6 +818,8 @@ class CloudTestCase(test.TestCase):
                                                   'hostname': 'server-1234',
                                                   'vm_state': 'active',
                                                   'system_metadata': sys_meta})
+
+        sys_meta['EC2_client_token'] = "client-token-2"
         inst2 = db.instance_create(self.context, {'reservation_id': 'a',
                                                   'image_ref': image_uuid,
                                                   'instance_type_id': 1,
@@ -878,8 +851,7 @@ class CloudTestCase(test.TestCase):
         self.assertEqual(len(result['instancesSet']), 1)
         instance = result['instancesSet'][0]
         self.assertEqual(instance['instanceId'], instance_id)
-        self.assertEqual(instance['placement']['availabilityZone'],
-                'zone2')
+        self.assertEqual(instance['placement']['availabilityZone'], 'zone2')
         self.assertEqual(instance['ipAddress'], '1.2.3.4')
         self.assertEqual(instance['dnsName'], '1.2.3.4')
         self.assertEqual(instance['tagSet'], [])
@@ -887,6 +859,7 @@ class CloudTestCase(test.TestCase):
         self.assertEqual(instance['privateIpAddress'], '192.168.0.3')
         self.assertEqual(instance['dnsNameV6'],
                 'fe80:b33f::a8bb:ccff:fedd:eeff')
+        self.assertEqual(instance['clientToken'], 'client-token-2')
 
         # A filter with even one invalid id should cause an exception to be
         # raised
@@ -1322,7 +1295,7 @@ class CloudTestCase(test.TestCase):
         result = self.cloud.describe_instances(self.context)
         result = result['reservationSet'][0]
         instance = result['instancesSet'][0]
-        self.assertEqual(instance['dnsName'], None)
+        self.assertIsNone(instance['dnsName'])
 
     def test_describe_images(self):
         describe_images = self.cloud.describe_images
@@ -1365,9 +1338,9 @@ class CloudTestCase(test.TestCase):
     def assertDictListUnorderedMatch(self, L1, L2, key):
         self.assertEqual(len(L1), len(L2))
         for d1 in L1:
-            self.assertTrue(key in d1)
+            self.assertIn(key, d1)
             for d2 in L2:
-                self.assertTrue(key in d2)
+                self.assertIn(key, d2)
                 if d1[key] == d2[key]:
                     self.assertThat(d1, matchers.DictMatches(d2))
 
@@ -1456,11 +1429,11 @@ class CloudTestCase(test.TestCase):
     def _assertImageSet(self, result, root_device_type, root_device_name):
         self.assertEqual(1, len(result['imagesSet']))
         result = result['imagesSet'][0]
-        self.assertTrue('rootDeviceType' in result)
+        self.assertIn('rootDeviceType', result)
         self.assertEqual(result['rootDeviceType'], root_device_type)
-        self.assertTrue('rootDeviceName' in result)
+        self.assertIn('rootDeviceName', result)
         self.assertEqual(result['rootDeviceName'], root_device_name)
-        self.assertTrue('blockDeviceMapping' in result)
+        self.assertIn('blockDeviceMapping', result)
 
         return result
 
@@ -1745,7 +1718,7 @@ class CloudTestCase(test.TestCase):
         self.stubs.Set(password, 'extract_password', lambda i: 'fakepass')
         output = self.cloud.get_password_data(context=self.context,
                                               instance_id=[instance_id])
-        self.assertEquals(output['passwordData'], 'fakepass')
+        self.assertEqual(output['passwordData'], 'fakepass')
         rv = self.cloud.terminate_instances(self.context, [instance_id])
 
     def test_console_output(self):
@@ -1755,7 +1728,7 @@ class CloudTestCase(test.TestCase):
             max_count=1)
         output = self.cloud.get_console_output(context=self.context,
                                                instance_id=[instance_id])
-        self.assertEquals(base64.b64decode(output['output']),
+        self.assertEqual(base64.b64decode(output['output']),
                 'FAKE CONSOLE OUTPUT\nANOTHER\nLAST LINE')
         # TODO(soren): We need this until we can stop polling in the rpc code
         #              for unit tests.
@@ -1891,6 +1864,70 @@ class CloudTestCase(test.TestCase):
         self.assertEqual(instance['instanceId'], 'i-00000001')
         self.assertEqual(instance['instanceState']['name'], 'running')
         self.assertEqual(instance['instanceType'], 'm1.small')
+
+    def test_run_instances_invalid_maxcount(self):
+        kwargs = {'image_id': 'ami-00000001',
+                  'instance_type': CONF.default_flavor,
+                  'max_count': 0}
+        run_instances = self.cloud.run_instances
+
+        def fake_show(self, context, id):
+            return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
+                    'container_format': 'ami',
+                    'status': 'active',
+                    'properties': {
+                    'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'ramdisk_id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'type': 'machine'},
+                    'status': 'active'}
+        self.stubs.UnsetAll()
+        self.stubs.Set(fake._FakeImageService, 'show', fake_show)
+        self.assertRaises(exception.InvalidInput, run_instances,
+                          self.context, **kwargs)
+
+    def test_run_instances_invalid_mincount(self):
+        kwargs = {'image_id': 'ami-00000001',
+                  'instance_type': CONF.default_flavor,
+                  'min_count': 0}
+        run_instances = self.cloud.run_instances
+
+        def fake_show(self, context, id):
+            return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
+                    'container_format': 'ami',
+                    'status': 'active',
+                    'properties': {
+                    'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'ramdisk_id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'type': 'machine'},
+                    'status': 'active'}
+        self.stubs.UnsetAll()
+        self.stubs.Set(fake._FakeImageService, 'show', fake_show)
+        self.assertRaises(exception.InvalidInput, run_instances,
+                          self.context, **kwargs)
+
+    def test_run_instances_invalid_count(self):
+        kwargs = {'image_id': 'ami-00000001',
+                  'instance_type': CONF.default_flavor,
+                  'max_count': 1,
+                  'min_count': 2}
+        run_instances = self.cloud.run_instances
+
+        def fake_show(self, context, id):
+            return {'id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'name': 'fake_name',
+                    'container_format': 'ami',
+                    'status': 'active',
+                    'properties': {
+                    'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'ramdisk_id': 'cedef40a-ed67-4d10-800e-17455edce175',
+                    'type': 'machine'},
+                    'status': 'active'}
+        self.stubs.UnsetAll()
+        self.stubs.Set(fake._FakeImageService, 'show', fake_show)
+        self.assertRaises(exception.InvalidInput, run_instances,
+                          self.context, **kwargs)
 
     def test_run_instances_availability_zone(self):
         kwargs = {'image_id': 'ami-00000001',
@@ -2135,6 +2172,22 @@ class CloudTestCase(test.TestCase):
         self.assertEqual(result, expected)
         self._restart_compute_service()
 
+    def test_start_instances_policy_failed(self):
+        kwargs = {'image_id': 'ami-1',
+                  'instance_type': CONF.default_flavor,
+                  'max_count': 1, }
+        instance_id = self._run_instance(**kwargs)
+        rules = {
+            "compute:start":
+                common_policy.parse_rule("project_id:non_fake"),
+        }
+        common_policy.set_rules(common_policy.Rules(rules))
+        exc = self.assertRaises(exception.PolicyNotAuthorized,
+                                self.cloud.start_instances,
+                                self.context, [instance_id])
+        self.assertIn("compute:start", exc.format_message())
+        self._restart_compute_service()
+
     def test_stop_instances(self):
         kwargs = {'image_id': 'ami-1',
                   'instance_type': CONF.default_flavor,
@@ -2152,6 +2205,22 @@ class CloudTestCase(test.TestCase):
                                            'name': 'terminated'}}]}
         result = self.cloud.terminate_instances(self.context, [instance_id])
         self.assertEqual(result, expected)
+        self._restart_compute_service()
+
+    def test_stop_instances_policy_failed(self):
+        kwargs = {'image_id': 'ami-1',
+                  'instance_type': CONF.default_flavor,
+                  'max_count': 1, }
+        instance_id = self._run_instance(**kwargs)
+        rules = {
+            "compute:stop":
+                common_policy.parse_rule("project_id:non_fake")
+        }
+        common_policy.set_rules(common_policy.Rules(rules))
+        exc = self.assertRaises(exception.PolicyNotAuthorized,
+                                self.cloud.stop_instances,
+                                self.context, [instance_id])
+        self.assertIn("compute:stop", exc.format_message())
         self._restart_compute_service()
 
     def test_terminate_instances(self):
@@ -2314,17 +2383,17 @@ class CloudTestCase(test.TestCase):
         self.stubs.Set(fake._FakeImageService, 'show', fake_show)
 
         def fake_block_device_mapping_get_all_by_instance(context, inst_id):
-            return [dict(id=1,
-                         source_type='snapshot',
-                         destination_type='volume',
-                         instance_uuid=inst_id,
-                         snapshot_id=snapshots[0],
-                         volume_id=volumes[0],
-                         volume_size=1,
-                         device_name='sda1',
-                         delete_on_termination=False,
-                         no_device=None,
-                         connection_info='{"foo":"bar"}')]
+            return [fake_block_device.FakeDbBlockDeviceDict(
+                        {'volume_id': volumes[0],
+                         'snapshot_id': snapshots[0],
+                         'source_type': 'snapshot',
+                         'destination_type': 'volume',
+                         'volume_size': 1,
+                         'device_name': 'sda1',
+                         'boot_index': 0,
+                         'delete_on_termination': False,
+                         'connection_info': '{"foo":"bar"}',
+                         'no_device': None})]
 
         self.stubs.Set(db, 'block_device_mapping_get_all_by_instance',
                        fake_block_device_mapping_get_all_by_instance)
@@ -2348,15 +2417,15 @@ class CloudTestCase(test.TestCase):
         created_image = self.cloud.describe_images(self.context,
                                                    ec2_ids)['imagesSet'][0]
 
-        self.assertTrue('blockDeviceMapping' in created_image)
+        self.assertIn('blockDeviceMapping', created_image)
         bdm = created_image['blockDeviceMapping'][0]
-        self.assertEquals(bdm.get('deviceName'), 'sda1')
-        self.assertTrue('ebs' in bdm)
-        self.assertEquals(bdm['ebs'].get('snapshotId'),
-                          ec2utils.id_to_ec2_snap_id(snapshots[0]))
-        self.assertEquals(created_image.get('kernelId'), 'aki-00000001')
-        self.assertEquals(created_image.get('ramdiskId'), 'ari-00000002')
-        self.assertEquals(created_image.get('rootDeviceType'), 'ebs')
+        self.assertEqual(bdm.get('deviceName'), 'sda1')
+        self.assertIn('ebs', bdm)
+        self.assertEqual(bdm['ebs'].get('snapshotId'),
+                         ec2utils.id_to_ec2_snap_id(snapshots[0]))
+        self.assertEqual(created_image.get('kernelId'), 'aki-00000001')
+        self.assertEqual(created_image.get('ramdiskId'), 'ari-00000002')
+        self.assertEqual(created_image.get('rootDeviceType'), 'ebs')
         self.assertNotEqual(virt_driver.get('powered_on'), no_reboot)
         self.assertNotEqual(virt_driver.get('powered_off'), no_reboot)
 
@@ -2389,14 +2458,15 @@ class CloudTestCase(test.TestCase):
         ec2_instance_id = self._run_instance(**kwargs)
 
         def fake_block_device_mapping_get_all_by_instance(context, inst_id):
-            return [dict(snapshot_id=snapshots[0],
-                         volume_id=volumes[0],
-                         source_type='snapshot',
-                         destination_type='volume',
-                         volume_size=1,
-                         device_name='vda',
-                         delete_on_termination=False,
-                         no_device=None)]
+            return [fake_block_device.FakeDbBlockDeviceDict(
+                        {'volume_id': volumes[0],
+                         'snapshot_id': snapshots[0],
+                         'source_type': 'snapshot',
+                         'destination_type': 'volume',
+                         'volume_size': 1,
+                         'device_name': 'vda',
+                         'delete_on_termination': False,
+                         'no_device': None})]
 
         self.stubs.Set(db, 'block_device_mapping_get_all_by_instance',
                        fake_block_device_mapping_get_all_by_instance)
@@ -2426,6 +2496,7 @@ class CloudTestCase(test.TestCase):
                     {'volume_id': None,
                      'snapshot_id': None,
                      'no_device': True,
+                     'source_type': 'blank',
                      'delete_on_termination': None,
                      'device_name': None},
                     {'volume_id': None,
@@ -2467,24 +2538,29 @@ class CloudTestCase(test.TestCase):
         self.stubs.Set(db, 'block_device_mapping_get_all_by_instance',
                        self._fake_bdm_get)
 
-        def fake_get(ctxt, instance_id):
+        def fake_get(ctxt, instance_id, want_objects=False):
+            self.assertTrue(want_objects)
             inst_type = flavors.get_default_flavor()
             inst_type['name'] = 'fake_type'
             sys_meta = flavors.save_flavor_info({}, inst_type)
-            sys_meta = utils.dict_to_metadata(sys_meta)
-            return {
-                'id': 0,
-                'uuid': 'e5fe5518-0288-4fa3-b0c4-c79764101b85',
-                'root_device_name': '/dev/sdh',
-                'security_groups': [{'name': 'fake0'}, {'name': 'fake1'}],
-                'vm_state': vm_states.STOPPED,
-                'kernel_id': 'cedef40a-ed67-4d10-800e-17455edce175',
-                'ramdisk_id': '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6',
-                'user_data': 'fake-user data',
-                'shutdown_terminate': False,
-                'disable_terminate': False,
-                'system_metadata': sys_meta,
-                }
+            secgroups = security_group_obj.SecurityGroupList()
+            secgroups.objects.append(
+                security_group_obj.SecurityGroup(name='fake0'))
+            secgroups.objects.append(
+                security_group_obj.SecurityGroup(name='fake1'))
+            instance = instance_obj.Instance()
+            instance.id = 0
+            instance.uuid = 'e5fe5518-0288-4fa3-b0c4-c79764101b85'
+            instance.root_device_name = '/dev/sdh'
+            instance.security_groups = secgroups
+            instance.vm_state = vm_states.STOPPED
+            instance.kernel_id = 'cedef40a-ed67-4d10-800e-17455edce175'
+            instance.ramdisk_id = '76fa36fc-c930-4bf3-8c8a-ea2a2420deb6'
+            instance.user_data = 'fake-user data'
+            instance.shutdown_terminate = False
+            instance.disable_terminate = False
+            instance.system_metadata = sys_meta
+            return instance
         self.stubs.Set(self.cloud.compute_api, 'get', fake_get)
 
         def fake_get_instance_uuid_by_ec2_id(ctxt, int_id):
@@ -2645,21 +2721,26 @@ class CloudTestCase(test.TestCase):
                 'hostname': 'server-1111',
                 'created_at': datetime.datetime(2012, 5, 1, 1, 1, 1)
         }
-
+        
         inst1 = db.instance_create(self.context, inst1_kwargs)
-        ec2_id = ec2utils.id_to_ec2_inst_id(inst1['uuid'])
 
+   	
+        ec2_id = ec2utils.id_to_ec2_inst_id(inst1['uuid'])
+        # Creating Image test case for Create_tag[sandeep]
+        image1234 = db.s3_image_create(self.context,
+                               'cedef40a-ed67-4d10-800e-17455edce175')  	
+	ec2_image_id = ec2utils.glance_id_to_ec2_id(self.context, image1234['uuid'])
+	
         # Create some tags
         md = {'key': 'foo', 'value': 'bar'}
         md_result = {'foo': 'bar'}
         self.cloud.create_tags(self.context, resource_id=[ec2_id],
                 tag=[md])
-
-        metadata = self.cloud.compute_api.get_instance_metadata(self.context,
+	metadata = self.cloud.compute_api.get_instance_metadata(self.context,
                 inst1)
         self.assertEqual(metadata, md_result)
         self.assertEqual(meta_changes, [{'foo': ['+', 'bar']}])
-
+        
         # Delete them
         self.cloud.delete_tags(self.context, resource_id=[ec2_id],
                 tag=[{'key': 'foo', 'value': 'bar'}])
@@ -2668,7 +2749,42 @@ class CloudTestCase(test.TestCase):
                 inst1)
         self.assertEqual(metadata, {})
         self.assertEqual(meta_changes, [{'foo': ['-']}])
+        
+        #Testing Create_tag for image[sandeep]
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id],
+                tag=[md])
+	#self.service = glance.get_default_image_service()
+	image_meta = self.cloud.service.show(self.context,image1234['uuid'])
+	
+	try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md_result)
 
+        # Delete them
+        self.cloud.delete_tags(self.context, resource_id=[ec2_image_id],
+                tag=[{'key': 'foo', 'value': 'bar'}])
+        image_meta1 = self.cloud.service.show(self.context,image1234['uuid'])
+ 	try :
+            image_meta1['properties'].pop('kernel_id')
+            image_meta1['properties'].pop('ramdisk_id')
+	    image_meta1['properties'].pop('image_state')
+            image_meta1['properties'].pop('type')	
+	    
+        except KeyError:
+            pass
+        meta = image_meta1['properties']
+
+	#if 'metadata' not in image_meta1['properties']:
+	  #  meta = None 
+	#else:
+	#    meta = image_meta1['properties']['metadata']	 
+        self.assertEqual(meta, {})
+        self.assertEqual(meta_changes, [{'foo': ['-']}])
+        
     def test_describe_tags(self):
         # We need to stub network calls
         self._stub_instance_get_with_fixed_ips('get_all')
@@ -2712,6 +2828,19 @@ class CloudTestCase(test.TestCase):
 
         inst2 = db.instance_create(self.context, inst2_kwargs)
         ec2_id2 = ec2utils.id_to_ec2_inst_id(inst2['uuid'])
+        
+        #Describing Tags For Images
+        
+	image1 = db.s3_image_create(self.context,
+                               'cedef40a-ed67-4d10-800e-17455edce175')
+
+        ec2_image_id1 = ec2utils.glance_id_to_ec2_id(self.context, image1['uuid'])
+        
+        image2 = db.s3_image_create(self.context,
+                               'c905cedb-7281-47e4-8a62-f26bc5fc4c77')
+
+        ec2_image_id2 = ec2utils.glance_id_to_ec2_id(self.context, image2['uuid'])
+        
 
         # Create some tags
         # We get one overlapping pair, and each has a different key value pair
@@ -2733,8 +2862,35 @@ class CloudTestCase(test.TestCase):
                 inst2)
         self.assertEqual(metadata, md_result)
 
+        # Creating Tags for Image
+        
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id1],
+                tag=[md])
+
+	self.cloud.create_tags(self.context, resource_id=[ec2_image_id2],
+                tag=[md])
+
+
+       # self.assertEqual(meta_changes, [{'foo': ['+', 'bar']}])
+        image_meta = self.cloud.service.show(self.context,image1['uuid'])
+	try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md_result)
+        
+        image_meta = self.cloud.service.show(self.context,image2['uuid'])
+	try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md_result)
         md2 = {'key': 'baz', 'value': 'quux'}
-        md2_result = {'baz': 'quux'}
+        md2_result = {'baz':'quux'}
         md2_result.update(md_result)
         self.cloud.create_tags(self.context, resource_id=[ec2_id2],
                 tag=[md2])
@@ -2745,8 +2901,20 @@ class CloudTestCase(test.TestCase):
                 inst2)
         self.assertEqual(metadata, md2_result)
 
+	# creating test case for image 
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id2],
+                tag=[md2])
+        image_meta = self.cloud.service.show(self.context,image2['uuid'])
+	try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md2_result)
+        
         md3 = {'key': 'bax', 'value': 'wibble'}
-        md3_result = {'bax': 'wibble'}
+        md3_result = {'bax':'wibble'}
         md3_result.update(md_result)
         self.cloud.create_tags(self.context, resource_id=[ec2_id1],
                 tag=[md3])
@@ -2756,7 +2924,24 @@ class CloudTestCase(test.TestCase):
         metadata = self.cloud.compute_api.get_instance_metadata(self.context,
                 inst1)
         self.assertEqual(metadata, md3_result)
+        
+        # Creating test case for image
+        
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id1],
+                tag=[md3])
 
+	#self.assertEqual(meta_changes, [{'bax': ['+', 'wibble']}])
+
+        image_meta = self.cloud.service.show(self.context,image1['uuid'])
+	try :
+	    image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+	except KeyError:
+            pass
+	meta = image_meta['properties']
+        self.assertEqual(meta, md3_result)
+        
+      
         inst1_key_foo = {'key': u'foo', 'resource_id': 'i-00000001',
                          'resource_type': 'instance', 'value': u'bar'}
         inst1_key_bax = {'key': u'bax', 'resource_id': 'i-00000001',
@@ -2766,67 +2951,100 @@ class CloudTestCase(test.TestCase):
         inst2_key_baz = {'key': u'baz', 'resource_id': 'i-00000002',
                          'resource_type': 'instance', 'value': u'quux'}
 
+	# For image 
+        
+        image1_key_foo = {'key': u'foo', 'resource_id': 'ami-00000001',
+                         'resource_type': 'image', 'value': u'bar'}
+        image1_key_bax = {'key': u'bax', 'resource_id': 'ami-00000001',
+                         'resource_type': 'image', 'value': u'wibble'}
+        image2_key_foo = {'key': u'foo', 'resource_id': 'ami-00000004',
+                         'resource_type': 'image', 'value': u'bar'}
+        image2_key_baz = {'key': u'baz', 'resource_id': 'ami-00000004',
+                         'resource_type': 'image', 'value': u'quux'}
+         
+               
+
         # We should be able to search by:
-        # No filter
+        # No filter For instances and Image
         tags = self.cloud.describe_tags(self.context)['tagSet']
         self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo,
-                                inst2_key_baz, inst1_key_bax])
-
-        # Resource ID
+                                inst2_key_baz, inst1_key_bax,
+				image1_key_foo, image2_key_foo,
+                                image2_key_baz, image1_key_bax])
+          
+        # We should be able to search by for Image:
+	# No filter For image[sandeep]
+     
+        # Resource ID for instances
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'resource-id',
                          'value': [ec2_id1]}])['tagSet']
         self.assertEqualSorted(tags, [inst1_key_foo, inst1_key_bax])
+		
+	# Resource ID for image
+        tags = self.cloud.describe_tags(self.context,
+                filter=[{'name': 'resource-id',
+                         'value': [ec2_image_id1]}])['tagSet']
+        self.assertEqualSorted(tags, [image1_key_foo, image1_key_bax])	
 
-        # Resource Type
+        # Resource Type for instances
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'resource-type',
                          'value': ['instance']}])['tagSet']
         self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo,
                                 inst2_key_baz, inst1_key_bax])
-
+        
+        # Resource Type for image
+        tags = self.cloud.describe_tags(self.context,
+                filter=[{'name': 'resource-type',
+                         'value': ['image']}])['tagSet']
+        self.assertEqualSorted(tags, [image1_key_foo, image2_key_foo,
+                                image2_key_baz, image1_key_bax])
+       
+ 
         # Key, either bare or with wildcards
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['foo']}])['tagSet']
-        self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo])
+        self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo, image1_key_foo, image2_key_foo])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['baz']}])['tagSet']
-        self.assertEqualSorted(tags, [inst2_key_baz])
+        self.assertEqualSorted(tags, [inst2_key_baz, image2_key_baz])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['ba?']}])['tagSet']
-        self.assertEqualSorted(tags, [inst1_key_bax, inst2_key_baz])
+        self.assertEqualSorted(tags, [inst1_key_bax, inst2_key_baz, image1_key_bax, image2_key_baz])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['b*']}])['tagSet']
-        self.assertEqualSorted(tags, [inst1_key_bax, inst2_key_baz])
+        self.assertEqualSorted(tags, [inst1_key_bax, inst2_key_baz, image1_key_bax, image2_key_baz])
+
 
         # Value, either bare or with wildcards
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'value',
                          'value': ['bar']}])['tagSet']
-        self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo])
+        self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo, image1_key_foo, image2_key_foo])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'value',
                          'value': ['wi*']}])['tagSet']
-        self.assertEqual(tags, [inst1_key_bax])
+        self.assertEqual(tags,[image1_key_bax, inst1_key_bax])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'value',
                          'value': ['quu?']}])['tagSet']
-        self.assertEqual(tags, [inst2_key_baz])
+        self.assertEqualSorted(tags, [image2_key_baz, inst2_key_baz])
 
         # Multiple values
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['baz', 'bax']}])['tagSet']
-        self.assertEqualSorted(tags, [inst2_key_baz, inst1_key_bax])
+        self.assertEqualSorted(tags, [inst2_key_baz, inst1_key_bax, image2_key_baz, image1_key_bax])
 
         # Multiple filters (AND): no match
         tags = self.cloud.describe_tags(self.context,
@@ -2842,7 +3060,7 @@ class CloudTestCase(test.TestCase):
                          'value': ['baz']},
                         {'name': 'value',
                          'value': ['quux']}])['tagSet']
-        self.assertEqualSorted(tags, [inst2_key_baz])
+        self.assertEqualSorted(tags, [inst2_key_baz, image2_key_baz])
 
         # And we should fail on supported resource types
         self.assertRaises(exception.InvalidParameterValue,
@@ -2873,13 +3091,13 @@ class CloudTestCase(test.TestCase):
         self.assertEqual(
                 ec2utils.resource_type_from_id(self.context, 'aki-12345'),
                 'image')
-        self.assertEqual(
-                ec2utils.resource_type_from_id(self.context, 'x-12345'),
-                None)
+        self.assertIsNone(
+                ec2utils.resource_type_from_id(self.context, 'x-12345'))
 
 
 class CloudTestCaseNeutronProxy(test.TestCase):
     def setUp(self):
+        super(CloudTestCaseNeutronProxy, self).setUp()
         cfg.CONF.set_override('security_group_api', 'neutron')
         self.cloud = cloud.CloudController()
         self.original_client = neutronv2.get_client
@@ -2889,7 +3107,6 @@ class CloudTestCaseNeutronProxy(test.TestCase):
         self.context = context.RequestContext(self.user_id,
                                               self.project_id,
                                               is_admin=True)
-        super(CloudTestCaseNeutronProxy, self).setUp()
 
     def tearDown(self):
         neutronv2.get_client = self.original_client

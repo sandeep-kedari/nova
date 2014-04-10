@@ -1,5 +1,3 @@
-# vim: tabstop=4 shiftwidth=4 softtabstop=4
-
 # Copyright 2011 Justin Santa Barbara
 # Copyright 2012 OpenStack Foundation
 # All Rights Reserved.
@@ -21,6 +19,7 @@
 import copy
 import datetime
 import uuid
+import re	
 
 from oslo.config import cfg
 
@@ -96,8 +95,7 @@ class _FakeImageService(object):
                  'container_format': 'ami',
                  'disk_format': 'ami',
                  'size': '84035174',
-                 'properties': {'kernel_id': CONF.null_kernel,
-                                'ramdisk_id': CONF.null_kernel}}
+                 'properties': {}}
 
         image5 = {'id': 'c905cedb-7281-47e4-8a62-f26bc5fc4c77',
                  'name': 'fakeimage123456',
@@ -146,6 +144,20 @@ class _FakeImageService(object):
                                 'architecture': 'x86_64',
                                 'auto_disk_config': 'True'}}
 
+        image8 = {'id': '123454678-31e7-49b7-b260-868f441e862b',
+                 'name': 'fakeimage7',
+                 'created_at': timestamp,
+                 'updated_at': timestamp,
+                 'deleted_at': None,
+                 'deleted': False,
+                 'status': 'active',
+                 'is_public': False,
+                 'container_format': 'ova',
+                 'disk_format': 'vhd',
+                 'size': '74185822',
+                 'properties': {  }}
+
+
         self.create(None, image1)
         self.create(None, image2)
         self.create(None, image3)
@@ -161,6 +173,63 @@ class _FakeImageService(object):
         """Return list of detailed image information."""
         return copy.deepcopy(self.images.values())
 
+    def get_all_image_metadata(self, context, search_filts):
+	"""Customize function for image meta"""
+	def _match_any(pattern_list, string):
+            return any([re.match(pattern, string)
+                        for pattern in pattern_list])
+
+        def _filter_metadata(image, search_filt, input_metadata):
+            uuids = search_filt.get('resource_id', [])
+            keys_filter = search_filt.get('key', [])
+            values_filter = search_filt.get('value', [])
+            output_metadata = {}
+
+            if uuids and image['id'] not in uuids:
+                return {}
+
+            for (k, v) in input_metadata.iteritems():
+                # Both keys and value defined -- AND
+                if ((keys_filter and values_filter) and
+                   not _match_any(keys_filter, k) and
+                   not _match_any(values_filter, v)):
+                    continue
+                # Only keys or value is defined
+                elif ((keys_filter and not _match_any(keys_filter, k)) or
+                      (values_filter and not _match_any(values_filter, v))):
+                    continue
+
+                output_metadata[k] = v
+            return output_metadata
+
+        formatted_metadata_list = []
+        images = self.images.values()
+        for image in images:
+            try:
+                metadata = image['properties']
+		try:
+		    metadata.pop('kernel_id')
+		    metadata.pop('ramdisk_id')
+		    metadata.pop('architecture')		
+		    metadata.pop('auto_disk_config')
+                except KeyError:
+	            pass
+                for filt in search_filts:
+                    # By chaining the input to the output, the filters are
+                    # ANDed together
+                    metadata = _filter_metadata(image, filt, metadata)
+
+                for (k, v) in metadata.iteritems():
+                    formatted_metadata_list.append({'key': k, 'value': v,
+                                     'image_id': image['id']})
+            except exception.PolicyNotAuthorized:
+                # failed policy check - not allowed to
+                # read this metadata
+                continue
+
+        return formatted_metadata_list
+ 	
+ 
     def download(self, context, image_id, dst_path=None, data=None):
         self.show(context, image_id)
         if data:
@@ -211,7 +280,10 @@ class _FakeImageService(object):
         else:
             image = self.images[image_id]
             try:
-                image['properties'].update(metadata.pop('properties'))
+		if metadata['properties']: 
+                    image['properties'].update(metadata.pop('properties'))
+		else:
+		    image['properties'] = dict() 	
             except KeyError:
                 pass
             image.update(metadata)
