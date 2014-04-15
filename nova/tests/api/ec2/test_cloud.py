@@ -158,8 +158,6 @@ class CloudTestCase(test.TestCase):
             image['name'] = kwargs.get('filters', {}).get('name')
             return [image]
 
-        self.stubs.Set(fake._FakeImageService, 'show', fake_show)
-        self.stubs.Set(fake._FakeImageService, 'detail', fake_detail)
         fake.stub_out_image_service(self.stubs)
 
         def dumb(*args, **kwargs):
@@ -2765,21 +2763,26 @@ class CloudTestCase(test.TestCase):
                 'hostname': 'server-1111',
                 'created_at': datetime.datetime(2012, 5, 1, 1, 1, 1)
         }
-
+        
         inst1 = db.instance_create(self.context, inst1_kwargs)
-        ec2_id = ec2utils.id_to_ec2_inst_id(inst1['uuid'])
 
+       
+        ec2_id = ec2utils.id_to_ec2_inst_id(inst1['uuid'])
+        # Creating Image test case for Create_tag[sandeep]
+        image1234 = db.s3_image_create(self.context,
+                               'cedef40a-ed67-4d10-800e-17455edce175')      
+        ec2_image_id = ec2utils.glance_id_to_ec2_id(self.context, image1234['uuid'])
+    
         # Create some tags
         md = {'key': 'foo', 'value': 'bar'}
         md_result = {'foo': 'bar'}
         self.cloud.create_tags(self.context, resource_id=[ec2_id],
                 tag=[md])
-
         metadata = self.cloud.compute_api.get_instance_metadata(self.context,
                 inst1)
         self.assertEqual(metadata, md_result)
         self.assertEqual(meta_changes, [{'foo': ['+', 'bar']}])
-
+        
         # Delete them
         self.cloud.delete_tags(self.context, resource_id=[ec2_id],
                 tag=[{'key': 'foo', 'value': 'bar'}])
@@ -2788,7 +2791,35 @@ class CloudTestCase(test.TestCase):
                 inst1)
         self.assertEqual(metadata, {})
         self.assertEqual(meta_changes, [{'foo': ['-']}])
+        
+        #Testing Create_tag for image
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id],
+                tag=[md])
+        image_meta = self.cloud.service.show(self.context,image1234['uuid'])
+    
+        try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md_result)
 
+        # Delete them
+        self.cloud.delete_tags(self.context, resource_id=[ec2_image_id],
+                tag=[{'key': 'foo', 'value': 'bar'}])
+        image_meta1 = self.cloud.service.show(self.context,image1234['uuid'])
+        try :
+            image_meta1['properties'].pop('kernel_id')
+            image_meta1['properties'].pop('ramdisk_id')
+            image_meta1['properties'].pop('image_state')
+            image_meta1['properties'].pop('type')    
+        except KeyError:
+            pass
+        meta = image_meta1['properties']
+        self.assertEqual(meta, {})
+        self.assertEqual(meta_changes, [{'foo': ['-']}])
+        
     def test_describe_tags(self):
         # We need to stub network calls
         self._stub_instance_get_with_fixed_ips('get_all')
@@ -2832,6 +2863,19 @@ class CloudTestCase(test.TestCase):
 
         inst2 = db.instance_create(self.context, inst2_kwargs)
         ec2_id2 = ec2utils.id_to_ec2_inst_id(inst2['uuid'])
+        
+        #Describing Tags For Images
+        
+        image1 = db.s3_image_create(self.context,
+                               'cedef40a-ed67-4d10-800e-17455edce175')
+
+        ec2_image_id1 = ec2utils.glance_id_to_ec2_id(self.context, image1['uuid'])
+        
+        image2 = db.s3_image_create(self.context,
+                               'c905cedb-7281-47e4-8a62-f26bc5fc4c77')
+
+        ec2_image_id2 = ec2utils.glance_id_to_ec2_id(self.context, image2['uuid'])
+        
 
         # Create some tags
         # We get one overlapping pair, and each has a different key value pair
@@ -2853,8 +2897,35 @@ class CloudTestCase(test.TestCase):
                 inst2)
         self.assertEqual(metadata, md_result)
 
+        # Creating Tags for Image
+        
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id1],
+                tag=[md])
+
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id2],
+                tag=[md])
+
+
+        image_meta = self.cloud.service.show(self.context,image1['uuid'])
+        try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md_result)
+        
+        image_meta = self.cloud.service.show(self.context,image2['uuid'])
+        try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md_result)
+
         md2 = {'key': 'baz', 'value': 'quux'}
-        md2_result = {'baz': 'quux'}
+        md2_result = {'baz':'quux'}
         md2_result.update(md_result)
         self.cloud.create_tags(self.context, resource_id=[ec2_id2],
                 tag=[md2])
@@ -2865,8 +2936,20 @@ class CloudTestCase(test.TestCase):
                 inst2)
         self.assertEqual(metadata, md2_result)
 
+        # creating test case for image 
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id2],
+                tag=[md2])
+        image_meta = self.cloud.service.show(self.context,image2['uuid'])
+        try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md2_result)
+        
         md3 = {'key': 'bax', 'value': 'wibble'}
-        md3_result = {'bax': 'wibble'}
+        md3_result = {'bax':'wibble'}
         md3_result.update(md_result)
         self.cloud.create_tags(self.context, resource_id=[ec2_id1],
                 tag=[md3])
@@ -2876,7 +2959,24 @@ class CloudTestCase(test.TestCase):
         metadata = self.cloud.compute_api.get_instance_metadata(self.context,
                 inst1)
         self.assertEqual(metadata, md3_result)
+        
+        # Creating test case for image
+        
+        self.cloud.create_tags(self.context, resource_id=[ec2_image_id1],
+                tag=[md3])
 
+        #self.assertEqual(meta_changes, [{'bax': ['+', 'wibble']}])
+
+        image_meta = self.cloud.service.show(self.context,image1['uuid'])
+        try :
+            image_meta['properties'].pop('kernel_id')
+            image_meta['properties'].pop('ramdisk_id')
+        except KeyError:
+            pass
+        meta = image_meta['properties']
+        self.assertEqual(meta, md3_result)
+        
+      
         inst1_key_foo = {'key': u'foo', 'resource_id': 'i-00000001',
                          'resource_type': 'instance', 'value': u'bar'}
         inst1_key_bax = {'key': u'bax', 'resource_id': 'i-00000001',
@@ -2886,67 +2986,100 @@ class CloudTestCase(test.TestCase):
         inst2_key_baz = {'key': u'baz', 'resource_id': 'i-00000002',
                          'resource_type': 'instance', 'value': u'quux'}
 
+    # For image 
+        
+        image1_key_foo = {'key': u'foo', 'resource_id': 'ami-00000001',
+                         'resource_type': 'image', 'value': u'bar'}
+        image1_key_bax = {'key': u'bax', 'resource_id': 'ami-00000001',
+                         'resource_type': 'image', 'value': u'wibble'}
+        image2_key_foo = {'key': u'foo', 'resource_id': 'ami-00000004',
+                         'resource_type': 'image', 'value': u'bar'}
+        image2_key_baz = {'key': u'baz', 'resource_id': 'ami-00000004',
+                         'resource_type': 'image', 'value': u'quux'}
+         
+               
+
         # We should be able to search by:
-        # No filter
+        # No filter For instances and Image
         tags = self.cloud.describe_tags(self.context)['tagSet']
         self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo,
-                                inst2_key_baz, inst1_key_bax])
-
-        # Resource ID
+                                inst2_key_baz, inst1_key_bax,
+    			image1_key_foo, image2_key_foo,
+                                image2_key_baz, image1_key_bax])
+          
+        # We should be able to search by for Image:
+        # No filter For image[sandeep]
+     
+        # Resource ID for instances
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'resource-id',
                          'value': [ec2_id1]}])['tagSet']
         self.assertEqualSorted(tags, [inst1_key_foo, inst1_key_bax])
+    	
+        # Resource ID for image
+        tags = self.cloud.describe_tags(self.context,
+                filter=[{'name': 'resource-id',
+                         'value': [ec2_image_id1]}])['tagSet']
+        self.assertEqualSorted(tags, [image1_key_foo, image1_key_bax])    
 
-        # Resource Type
+        # Resource Type for instances
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'resource-type',
                          'value': ['instance']}])['tagSet']
         self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo,
                                 inst2_key_baz, inst1_key_bax])
-
+        
+        # Resource Type for image
+        tags = self.cloud.describe_tags(self.context,
+                filter=[{'name': 'resource-type',
+                         'value': ['image']}])['tagSet']
+        self.assertEqualSorted(tags, [image1_key_foo, image2_key_foo,
+                                image2_key_baz, image1_key_bax])
+       
+ 
         # Key, either bare or with wildcards
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['foo']}])['tagSet']
-        self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo])
+        self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo, image1_key_foo, image2_key_foo])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['baz']}])['tagSet']
-        self.assertEqualSorted(tags, [inst2_key_baz])
+        self.assertEqualSorted(tags, [inst2_key_baz, image2_key_baz])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['ba?']}])['tagSet']
-        self.assertEqualSorted(tags, [inst1_key_bax, inst2_key_baz])
+        self.assertEqualSorted(tags, [inst1_key_bax, inst2_key_baz, image1_key_bax, image2_key_baz])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['b*']}])['tagSet']
-        self.assertEqualSorted(tags, [inst1_key_bax, inst2_key_baz])
+        self.assertEqualSorted(tags, [inst1_key_bax, inst2_key_baz, image1_key_bax, image2_key_baz])
+
 
         # Value, either bare or with wildcards
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'value',
                          'value': ['bar']}])['tagSet']
-        self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo])
+        self.assertEqualSorted(tags, [inst1_key_foo, inst2_key_foo, image1_key_foo, image2_key_foo])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'value',
                          'value': ['wi*']}])['tagSet']
-        self.assertEqual(tags, [inst1_key_bax])
+        self.assertEqual(tags,[image1_key_bax, inst1_key_bax])
 
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'value',
                          'value': ['quu?']}])['tagSet']
-        self.assertEqual(tags, [inst2_key_baz])
+        self.assertEqual(tags, [image2_key_baz, inst2_key_baz])
 
         # Multiple values
         tags = self.cloud.describe_tags(self.context,
                 filter=[{'name': 'key',
                          'value': ['baz', 'bax']}])['tagSet']
-        self.assertEqualSorted(tags, [inst2_key_baz, inst1_key_bax])
+        self.assertEqualSorted(tags, [inst2_key_baz, inst1_key_bax, image2_key_baz, image1_key_bax])
 
         # Multiple filters (AND): no match
         tags = self.cloud.describe_tags(self.context,
@@ -2962,7 +3095,7 @@ class CloudTestCase(test.TestCase):
                          'value': ['baz']},
                         {'name': 'value',
                          'value': ['quux']}])['tagSet']
-        self.assertEqualSorted(tags, [inst2_key_baz])
+        self.assertEqualSorted(tags, [inst2_key_baz, image2_key_baz])
 
         # And we should fail on supported resource types
         self.assertRaises(exception.InvalidParameterValue,

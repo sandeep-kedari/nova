@@ -263,7 +263,61 @@ class GlanceImageService(object):
                 _images.append(_translate_from_glance(image))
 
         return _images
+    
+    def get_all_image_metadata(self, context, search_filts):
+        """Customise Function for Image_metadata"""
+        return self._get_all_image_metadata(context, search_filts, metadata_type='metadata')
+    
+    def _get_all_image_metadata(self, context, search_filts, metadata_type):
+        """Get all metadata."""
 
+        def _match_any(pattern_list, string):
+            return any([re.match(pattern, string)
+                        for pattern in pattern_list])
+
+        def _filter_metadata(image, search_filt, input_metadata):
+            uuids = search_filt.get('resource_id', [])
+            keys_filter = search_filt.get('key', [])
+            values_filter = search_filt.get('value', [])
+            output_metadata = {}
+
+            if uuids and image['id'] not in uuids:
+                return {}
+
+            for (k, v) in input_metadata.iteritems():
+                # Both keys and value defined -- AND
+                if ((keys_filter and values_filter) and
+                   not _match_any(keys_filter, k) and
+                   not _match_any(values_filter, v)):
+                    continue
+                # Only keys or value is defined
+                elif ((keys_filter and not _match_any(keys_filter, k)) or
+                      (values_filter and not _match_any(values_filter, v))):
+                    continue
+
+                output_metadata[k] = v
+            return output_metadata
+
+        formatted_metadata_list = []
+        images = self.detail(context)
+        for image in images:
+            try:
+                metadata = image['properties']
+                for filt in search_filts:
+                    # By chaining the input to the output, the filters are
+                    # ANDed together
+                    metadata = _filter_metadata(image, filt, metadata)
+
+                for (k, v) in metadata.iteritems():
+                    formatted_metadata_list.append({'key': k, 'value': v,
+                                     'image_id': image['id']})
+            except exception.PolicyNotAuthorized:
+                # failed policy check - not allowed to
+                # read this metadata
+                continue
+
+        return formatted_metadata_list
+    
     def show(self, context, image_id):
         """Returns a dict with image data for the given opaque image id."""
         try:
@@ -509,25 +563,14 @@ def _convert_to_string(metadata):
 
 
 def _extract_attributes(image):
-    #NOTE(hdd): If a key is not found, base.Resource.__getattr__() may perform
-    # a get(), resulting in a useless request back to glance. This list is
-    # therefore sorted, with dependent attributes as the end
-    # 'deleted_at' depends on 'deleted'
-    # 'checksum' depends on 'status' == 'active'
     IMAGE_ATTRIBUTES = ['size', 'disk_format', 'owner',
-                        'container_format', 'status', 'id',
+                        'container_format', 'checksum', 'id',
                         'name', 'created_at', 'updated_at',
-                        'deleted', 'deleted_at', 'checksum',
+                        'deleted_at', 'deleted', 'status',
                         'min_disk', 'min_ram', 'is_public']
     output = {}
-
     for attr in IMAGE_ATTRIBUTES:
-        if attr == 'deleted_at' and not output['deleted']:
-            output[attr] = None
-        elif attr == 'checksum' and output['status'] != 'active':
-            output[attr] = None
-        else:
-            output[attr] = getattr(image, attr)
+        output[attr] = getattr(image, attr, None)
 
     output['properties'] = getattr(image, 'properties', {})
 

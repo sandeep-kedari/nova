@@ -1757,16 +1757,19 @@ class CloudController(object):
             msg = _('Expecting a list of resources')
             raise exception.InvalidParameterValue(message=msg)
 
-        for r in resources:
-            if ec2utils.resource_type_from_id(context, r) != 'instance':
-                msg = _('Only instances implemented')
-                raise exception.InvalidParameterValue(message=msg)
-
         if not isinstance(tags, (tuple, list, set)):
             msg = _('Expecting a list of tagSets')
             raise exception.InvalidParameterValue(message=msg)
-
+        
         metadata = {}
+       
+        for r in resources:
+            resource_list=['instance','image']
+            tag_created_for = ec2utils.resource_type_from_id(context, r)
+            if tag_created_for not in resource_list:
+                msg = _('Only instances and Images only Implemented')
+                raise exception.InvalidParameterValue(message=msg)
+        
         for tag in tags:
             if not isinstance(tag, dict):
                 err = _('Expecting tagSet to be key/value pairs')
@@ -1779,14 +1782,22 @@ class CloudController(object):
                 err = _('Expecting both key and value to be set')
                 raise exception.InvalidParameterValue(message=err)
 
-            metadata[key] = val
+        metadata[key] =  val
 
         for ec2_id in resources:
-            instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
-            instance = self.compute_api.get(context, instance_uuid,
+            if tag_created_for == 'instance':
+                instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
+                instance = self.compute_api.get(context, instance_uuid,
                                             want_objects=True)
-            self.compute_api.update_instance_metadata(context,
+                self.compute_api.update_instance_metadata(context,
                 instance, metadata)
+
+            elif tag_created_for == 'image':
+                self.service = glance.get_default_image_service()
+                image_uuid = ec2utils.ec2_id_to_glance_id(context,ec2_id)
+                image = self.service.show(context,image_uuid)
+                image['properties'].update(metadata)
+                self.service.update(context, image_uuid,image)
 
         return True
 
@@ -1806,21 +1817,19 @@ class CloudController(object):
         if not isinstance(resources, (tuple, list, set)):
             msg = _('Expecting a list of resources')
             raise exception.InvalidParameterValue(message=msg)
-
-        for r in resources:
-            if ec2utils.resource_type_from_id(context, r) != 'instance':
-                msg = _('Only instances implemented')
-                raise exception.InvalidParameterValue(message=msg)
-
+    
         if not isinstance(tags, (tuple, list, set)):
             msg = _('Expecting a list of tagSets')
             raise exception.InvalidParameterValue(message=msg)
 
-        for ec2_id in resources:
-            instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
-            instance = self.compute_api.get(context, instance_uuid,
-                                            want_objects=True)
-            for tag in tags:
+        """Newly Added code for checking Resource Type"""
+        for r in resources:
+            resource_list=['instance','image']
+            tag_created_for = ec2utils.resource_type_from_id(context, r)
+            if tag_created_for not in resource_list:
+                msg = _('Only instances and Images only Implemented')
+
+        for tag in tags:
                 if not isinstance(tag, dict):
                     msg = _('Expecting tagSet to be key/value pairs')
                     raise exception.InvalidParameterValue(message=msg)
@@ -1830,9 +1839,19 @@ class CloudController(object):
                     msg = _('Expecting key to be set')
                     raise exception.InvalidParameterValue(message=msg)
 
+        for ec2_id in resources:
+            if tag_created_for == 'instance':
+                instance_uuid = ec2utils.ec2_inst_id_to_uuid(context, ec2_id)
+                instance = self.compute_api.get(context, instance_uuid,
+                                            want_objects=True)
                 self.compute_api.delete_instance_metadata(context,
                         instance, key)
-
+            elif tag_created_for == 'image':
+                self.service = glance.get_default_image_service()
+                image_uuid = ec2utils.ec2_id_to_glance_id(context,ec2_id)
+                image = self.service.show(context, image_uuid)
+                image['properties'].pop(key,None)
+                self.service.update(context, image_uuid,image)
         return True
 
     def describe_tags(self, context, **kwargs):
@@ -1844,6 +1863,8 @@ class CloudController(object):
         """
         filters = kwargs.get('filter', None)
         search_filts = []
+        isImage=None
+        isInstance=None
         if filters:
             for filter_block in filters:
                 key_name = filter_block.get('name', None)
@@ -1858,28 +1879,54 @@ class CloudController(object):
                     if key_name in ('resource_id', 'resource-id'):
                         search_block['resource_id'] = []
                         for res_id in val:
-                            search_block['resource_id'].append(
-                                ec2utils.ec2_inst_id_to_uuid(context, res_id))
+                            if 'ami-0' in res_id:
+                                isImage = True
+                                isInstance = False
+                                search_block['resource_id'].append(
+                                ec2utils.ec2_id_to_glance_id(context, res_id))
+                            else:
+                                isImage = False
+                                search_block['resource_id'].append(
+                                    ec2utils.ec2_inst_id_to_uuid(context, res_id))
                     elif key_name in ['key', 'value']:
+                        isImage = True
+                        isInstance = True
                         search_block[key_name] = \
                             [ec2utils.regex_from_ec2_regex(v) for v in val]
                     elif key_name in ('resource_type', 'resource-type'):
+                        resource_list=['instance','image']
                         for res_type in val:
-                            if res_type != 'instance':
+                            if res_type not in resource_list:
                                 raise exception.InvalidParameterValue(
-                                    message=_('Only instances implemented'))
-                            search_block[key_name] = 'instance'
-                    if len(search_block.keys()) > 0:
-                        search_filts.append(search_block)
+                                    message=_('Only instances and Image implemented'))
+                            if res_type == 'image':
+                                isImage = True
+                                isInstance = False
+                                search_block[key_name] = res_type
+                            else:
+                                isImage = False
+                                search_block[key_name] = res_type
+                                if len(search_block.keys()) > 0:
+                                    search_filts.append(search_block)
         ts = []
-        for tag in self.compute_api.get_all_instance_metadata(context,
+        self.service = glance.get_default_image_service()
+        if isImage == True or isImage == None: 
+            for image_tag in  self.service.get_all_image_metadata(context, search_filts):
+                   ts.append({
+                       'resource_id': ec2utils.glance_id_to_ec2_id(context, image_tag['image_id']),
+                              'resource_type': 'image',
+                        'key': image_tag['key'],
+                            'value': image_tag['value']
+                    })
+        if isInstance == True or isInstance == None:
+            for tag in self.compute_api.get_all_instance_metadata(context,
                                                               search_filts):
-            ts.append({
-                'resource_id': ec2utils.id_to_ec2_inst_id(tag['instance_id']),
-                'resource_type': 'instance',
-                'key': tag['key'],
-                'value': tag['value']
-            })
+                ts.append({
+                    'resource_id': ec2utils.id_to_ec2_inst_id(tag['instance_id']),
+                    'resource_type': 'instance',
+                    'key': tag['key'],
+                    'value': tag['value']
+                })
         return {"tagSet": ts}
 
 
