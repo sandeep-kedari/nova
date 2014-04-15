@@ -18,6 +18,7 @@
 
 import copy
 import datetime
+import re
 import uuid
 
 from oslo.config import cfg
@@ -160,10 +161,11 @@ class _FakeImageService(object):
         return copy.deepcopy(self.images.values())
 
     def get_all_image_metadata(self, context, search_filts):
-        """Customize function for image meta"""
+        """Customize function for image meta."""
         def _match_any(pattern_list, string):
             return any([re.match(pattern, string)
                         for pattern in pattern_list])
+
         def _filter_metadata(image, search_filt, input_metadata):
             uuids = search_filt.get('resource_id', [])
             keys_filter = search_filt.get('key', [])
@@ -182,7 +184,6 @@ class _FakeImageService(object):
                 elif ((keys_filter and not _match_any(keys_filter, k)) or
                        (values_filter and not _match_any(values_filter, v))):
                     continue
-              
                 output_metadata[k] = v
             return output_metadata
 
@@ -203,7 +204,7 @@ class _FakeImageService(object):
                     # ANDed together
                     metadata = _filter_metadata(image, filt, metadata)
                 for (k, v) in metadata.iteritems():
-                     formatted_metadata_list.append({'key': k, 'value': v,
+                    formatted_metadata_list.append({'key': k, 'value': v,
                                       'image_id': image['id']})
             except exception.PolicyNotAuthorized:
                 # failed policy check - not allowed to

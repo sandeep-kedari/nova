@@ -21,6 +21,7 @@ import copy
 import itertools
 import json
 import random
+import re
 import sys
 import time
 
@@ -263,11 +264,12 @@ class GlanceImageService(object):
                 _images.append(_translate_from_glance(image))
 
         return _images
-    
+
     def get_all_image_metadata(self, context, search_filts):
-        """Customise Function for Image_metadata"""
-        return self._get_all_image_metadata(context, search_filts, metadata_type='metadata')
-    
+        """Customise Function for Image_metadata."""
+        return self._get_all_image_metadata(context, search_filts,
+                                            metadata_type='metadata')
+
     def _get_all_image_metadata(self, context, search_filts, metadata_type):
         """Get all metadata."""
 
@@ -317,7 +319,7 @@ class GlanceImageService(object):
                 continue
 
         return formatted_metadata_list
-    
+
     def show(self, context, image_id):
         """Returns a dict with image data for the given opaque image id."""
         try:
