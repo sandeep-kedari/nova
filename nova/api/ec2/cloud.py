@@ -38,7 +38,6 @@ from nova.compute import api as compute_api
 from nova.compute import vm_states
 from nova import db
 from nova import exception
-from nova.image import glance
 from nova.image import s3
 from nova import network
 from nova.network.security_group import neutron_driver
@@ -1794,11 +1793,11 @@ class CloudController(object):
                 instance, metadata)
 
             elif tag_created_for == 'image':
-                self.service = glance.get_default_image_service()
+                ec2_id2 = ec2utils.ec2_id_to_id(ec2_id)
                 image_uuid = ec2utils.ec2_id_to_glance_id(context, ec2_id)
-                image = self.service.show(context, image_uuid)
+                image = self.image_service.show(context, ec2_id2)
                 image['properties'].update(metadata)
-                self.service.update(context, image_uuid, image)
+                self.image_service.update(context, ec2_id2, image)
 
         return True
 
@@ -1848,11 +1847,10 @@ class CloudController(object):
                 self.compute_api.delete_instance_metadata(context,
                         instance, key)
             elif tag_created_for == 'image':
-                self.service = glance.get_default_image_service()
-                image_uuid = ec2utils.ec2_id_to_glance_id(context, ec2_id)
-                image = self.service.show(context, image_uuid)
+                ec2_id2 = ec2utils.ec2_id_to_id(ec2_id)
+                image = self.image_service.show(context, ec2_id2)
                 image['properties'].pop(key, None)
-                self.service.update(context, image_uuid, image)
+                self.image_service.update(context, ec2_id2, image)
         return True
 
     def describe_tags(self, context, **kwargs):
@@ -1912,16 +1910,17 @@ class CloudController(object):
                                 if len(search_block.keys()) > 0:
                                     search_filts.append(search_block)
         ts = []
-        self.service = glance.get_default_image_service()
         if isImage == True or isImage == None:
-            for image_tag in self.service.get_all_image_metadata(context,
+            for image_tag in self.image_service.get_all_image_metadata(context,
                                                              search_filts):
+
+                if image_tag['key'] in ('kernel_id', 'ramdisk_id'):
+                    continue
                 ts.append({
-                       'resource_id': ec2utils.glance_id_to_ec2_id(context,
-                                                     image_tag['image_id']),
-                              'resource_type': 'image',
+                       'resource_id': ec2utils.image_ec2_id(image_tag['id']),
+                                                  'resource_type': 'image',
                         'key': image_tag['key'],
-                            'value': image_tag['value']
+                        'value': image_tag['value']
                     })
         if isInstance == True or isInstance == None:
             for tag in self.compute_api.get_all_instance_metadata(context,

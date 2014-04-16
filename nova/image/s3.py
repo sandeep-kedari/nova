@@ -153,6 +153,10 @@ class S3ImageService(object):
         image_uuid = ec2utils.id_to_glance_id(context, image_id)
         self.service.delete(context, image_uuid)
 
+    def get_all_image_metadata(self, context, search_filts):
+	    metadata = self.service.get_all_image_metadata(context, search_filts)
+        return self._translate_uuids_to_ids(context, metadata)
+
     def update(self, context, image_id, metadata, data=None):
         image_uuid = ec2utils.id_to_glance_id(context, image_id)
         metadata = self._translate_id_to_uuid(context, metadata)

@@ -312,7 +312,7 @@ class GlanceImageService(object):
 
                 for (k, v) in metadata.iteritems():
                     formatted_metadata_list.append({'key': k, 'value': v,
-                                     'image_id': image['id']})
+                                     'id': image['id']})
             except exception.PolicyNotAuthorized:
                 # failed policy check - not allowed to
                 # read this metadata

@@ -262,7 +262,7 @@ class _FakeImageService(object):
         else:
             image = self.images[image_id]
             try:
-                if metadata['properties']:
+                if properties in metadata:
                     image['properties'].update(metadata.pop('properties'))
                 else:
                     image['properties'] = dict()
