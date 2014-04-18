@@ -154,7 +154,7 @@ class S3ImageService(object):
         self.service.delete(context, image_uuid)
 
     def get_all_image_metadata(self, context, search_filts):
-	    metadata = self.service.get_all_image_metadata(context, search_filts)
+        metadata = self.service.get_all_image_metadata(context, search_filts)
         return self._translate_uuids_to_ids(context, metadata)
 
     def update(self, context, image_id, metadata, data=None):

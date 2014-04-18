@@ -262,10 +262,7 @@ class _FakeImageService(object):
         else:
             image = self.images[image_id]
             try:
-                if properties in metadata:
-                    image['properties'].update(metadata.pop('properties'))
-                else:
-                    image['properties'] = dict()
+                image['properties'].update(metadata.pop('properties'))
             except KeyError:
                 pass
             image.update(metadata)

@@ -1794,7 +1794,6 @@ class CloudController(object):
 
             elif tag_created_for == 'image':
                 ec2_id2 = ec2utils.ec2_id_to_id(ec2_id)
-                image_uuid = ec2utils.ec2_id_to_glance_id(context, ec2_id)
                 image = self.image_service.show(context, ec2_id2)
                 image['properties'].update(metadata)
                 self.image_service.update(context, ec2_id2, image)
@@ -1917,7 +1916,8 @@ class CloudController(object):
                 if image_tag['key'] in ('kernel_id', 'ramdisk_id'):
                     continue
                 ts.append({
-                       'resource_id': ec2utils.image_ec2_id(image_tag['id']),
+                       'resource_id': ec2utils.glance_id_to_ec2_id(context,
+                                                           image_tag['image_id']),
                                                   'resource_type': 'image',
                         'key': image_tag['key'],
                         'value': image_tag['value']
