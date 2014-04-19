@@ -19,6 +19,7 @@
 import base64
 import binascii
 import os
+import re
 import shutil
 import tarfile
 import tempfile
@@ -152,6 +153,68 @@ class S3ImageService(object):
     def delete(self, context, image_id):
         image_uuid = ec2utils.id_to_glance_id(context, image_id)
         self.service.delete(context, image_uuid)
+
+    def get_all_image_metadata(self, context, search_filts):
+        """Customise Function for Image_metadata."""
+        return self._get_all_image_metadata(context, search_filts,
+                                            metadata_type='metadata')
+
+    def _get_all_image_metadata(self, context, search_filts, metadata_type):
+        """Get all metadata."""
+
+        def _match_any(pattern_list, string):
+            return any([re.match(pattern, string)
+                        for pattern in pattern_list])
+
+        def _filter_metadata(image, search_filt, input_metadata):
+            uuids = search_filt.get('resource_id', [])
+            keys_filter = search_filt.get('key', [])
+            values_filter = search_filt.get('value', [])
+            output_metadata = {}
+
+            if uuids and image['id'] not in uuids:
+                return {}
+
+            for (k, v) in input_metadata.iteritems():
+                v = str(v)
+                # Both keys and value defined -- AND
+                if ((keys_filter and values_filter) and
+                   not _match_any(keys_filter, k) and
+                   not _match_any(values_filter, v)):
+                    continue
+                # Only keys or value is defined
+                elif ((keys_filter and not _match_any(keys_filter, k)) or
+                      (values_filter and not _match_any(values_filter, v))):
+                    continue
+
+                output_metadata[k] = v
+            return output_metadata
+
+        formatted_metadata_list = []
+        images = self.detail(context)
+        for image in images:
+            try:
+                metadata = image['properties']
+                for filt in search_filts:
+                    # By chaining the input to the output, the filters are
+                    # ANDed together
+                    metadata = _filter_metadata(image, filt, metadata)
+
+                for (k, v) in metadata.iteritems():
+                    if k in ('ramdisk_id', 'kernel_id',
+                             'auto_disk_config', 'architecture'):
+                        continue
+                    formatted_metadata_list.\
+                        append({'key': k, 'value': v,
+                                'id': image['id'],
+                                'container_format': image['container_format']
+                               })
+            except exception.PolicyNotAuthorized:
+                # failed policy check - not allowed to
+                # read this metadata
+                continue
+
+        return formatted_metadata_list
 
     def update(self, context, image_id, metadata, data=None):
         image_uuid = ec2utils.id_to_glance_id(context, image_id)
